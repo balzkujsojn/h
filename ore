@@ -1,0 +1,1337 @@
+repeat task.wait() until game:IsLoaded()
+local Players = game:GetService("Players")
+repeat task.wait() until Players.LocalPlayer
+local player = Players.LocalPlayer
+
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+-- Colors - YinYang theme (black & white)
+local COLORS = {
+    Background = Color3.fromRGB(25, 25, 25),
+    Card = Color3.fromRGB(35, 35, 35),
+    Text = Color3.fromRGB(240, 240, 240),
+    TextSecondary = Color3.fromRGB(180, 180, 180),
+    Success = Color3.fromRGB(255, 255, 255),
+    Danger = Color3.fromRGB(255, 255, 255),
+    Border = Color3.fromRGB(60, 60, 60),
+    White = Color3.fromRGB(255, 255, 255),
+    Black = Color3.fromRGB(30, 30, 30)
+}
+
+-- Configuration
+local CONFIG = {
+    AutoUpdateInterval = 3,
+    CacheLifetime = 2,
+    ThrottleRate = 0.5,
+    
+    -- Ore filtering settings
+    IgnoreSize = Vector3.new(500, 100, 500),
+    IgnorePosition = Vector3.new(3010, 1499.99963, -80),
+    PositionTolerance = 5
+}
+
+-- Cache for performance optimization
+local cache = {
+    lastOreUpdate = 0,
+    oresCache = {},
+    playerPosition = nil,
+    lastPositionUpdate = 0,
+    ignorePartsCache = nil,
+    lastIgnoreCacheUpdate = 0,
+    platformBounds = nil
+}
+
+-- Settings
+local SETTINGS = {
+    VisibleOres = {},
+    OreWhitelist = {}
+}
+
+-- Pre-calculate platform bounds once
+local function calculatePlatformBounds()
+    if not cache.platformBounds then
+        local halfSize = CONFIG.IgnoreSize / 2
+        cache.platformBounds = {
+            min = CONFIG.IgnorePosition - halfSize,
+            max = CONFIG.IgnorePosition + halfSize
+        }
+    end
+    return cache.platformBounds
+end
+
+-- Optimized: Save settings with debouncing
+local settingsSaveCooldown = 0
+local function saveSettings()
+    local now = tick()
+    if now - settingsSaveCooldown < 2 then
+        return
+    end
+    settingsSaveCooldown = now
+    
+    local success, err = pcall(function()
+        local json = game:GetService("HttpService"):JSONEncode({
+            VisibleOres = SETTINGS.VisibleOres,
+            OreWhitelist = SETTINGS.OreWhitelist
+        })
+        
+        local orderedVisible = {}
+        for name, _ in pairs(SETTINGS.VisibleOres) do
+            table.insert(orderedVisible, name)
+        end
+        table.sort(orderedVisible)
+        
+        local orderedWhitelist = {}
+        for name, _ in pairs(SETTINGS.OreWhitelist) do
+            table.insert(orderedWhitelist, name)
+        end
+        table.sort(orderedWhitelist)
+        
+        local data = {
+            VisibleOres = orderedVisible,
+            OreWhitelist = orderedWhitelist
+        }
+        
+        local encoded = game:GetService("HttpService"):JSONEncode(data)
+        
+        if player then
+            local folderName = "OreTeleporter_Settings"
+            local settingsKey = tostring(player.UserId)
+            
+            local settingsFolder = workspace:FindFirstChild(folderName)
+            if not settingsFolder then
+                settingsFolder = Instance.new("Folder")
+                settingsFolder.Name = folderName
+                settingsFolder.Parent = workspace
+            end
+            
+            local settingValue = settingsFolder:FindFirstChild(settingsKey)
+            if not settingValue then
+                settingValue = Instance.new("StringValue")
+                settingValue.Name = settingsKey
+                settingValue.Parent = settingsFolder
+            end
+            
+            settingValue.Value = encoded
+        end
+    end)
+    
+    if not success then
+        warn("Failed to save settings:", err)
+    end
+end
+
+-- Load settings
+local function loadSettings()
+    local success, err = pcall(function()
+        if player then
+            local folderName = "OreTeleporter_Settings"
+            local settingsKey = tostring(player.UserId)
+            
+            local settingsFolder = workspace:FindFirstChild(folderName)
+            if settingsFolder then
+                local settingValue = settingsFolder:FindFirstChild(settingsKey)
+                if settingValue and settingValue.Value ~= "" then
+                    local data = game:GetService("HttpService"):JSONDecode(settingValue.Value)
+                    
+                    if data.VisibleOres then
+                        for _, oreName in ipairs(data.VisibleOres) do
+                            SETTINGS.VisibleOres[oreName] = true
+                        end
+                    end
+                    
+                    if data.OreWhitelist then
+                        for _, oreName in ipairs(data.OreWhitelist) do
+                            SETTINGS.OreWhitelist[oreName] = true
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    
+    if not success then
+        warn("Failed to load settings:", err)
+    end
+end
+
+-- Utility functions
+local function createRoundedCorners(parent, cornerRadius)
+    local uicorner = Instance.new("UICorner")
+    uicorner.CornerRadius = UDim.new(0, cornerRadius)
+    uicorner.Parent = parent
+    return uicorner
+end
+
+local function createStroke(parent, thickness, color)
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = thickness
+    stroke.Color = color
+    stroke.Transparency = 0.8
+    stroke.Parent = parent
+    return stroke
+end
+
+-- Optimized: Cache ignore parts and check less frequently
+local function getIgnoreParts()
+    local now = tick()
+    if cache.ignorePartsCache and now - cache.lastIgnoreCacheUpdate < 10 then
+        return cache.ignorePartsCache
+    end
+    
+    local ignoreParts = {}
+    local bounds = calculatePlatformBounds()
+    
+    local parts = workspace:FindPartsInRegion3(
+        Region3.new(bounds.min, bounds.max),
+        nil,
+        100
+    )
+    
+    for _, part in ipairs(parts) do
+        if part:IsA("BasePart") then
+            local sizeMatch = math.abs(part.Size.X - CONFIG.IgnoreSize.X) < 5 and
+                             math.abs(part.Size.Y - CONFIG.IgnoreSize.Y) < 5 and
+                             math.abs(part.Size.Z - CONFIG.IgnoreSize.Z) < 5
+            
+            if sizeMatch then
+                local posDiff = (part.Position - CONFIG.IgnorePosition)
+                local distance = posDiff.Magnitude
+                if distance < CONFIG.PositionTolerance then
+                    table.insert(ignoreParts, part)
+                end
+            end
+        end
+    end
+    
+    cache.ignorePartsCache = ignoreParts
+    cache.lastIgnoreCacheUpdate = now
+    
+    return ignoreParts
+end
+
+-- Optimized: Check if position is within platform bounds (very fast)
+local function isPositionInPlatform(position)
+    local bounds = calculatePlatformBounds()
+    return position.X >= bounds.min.X and position.X <= bounds.max.X and
+           position.Y >= bounds.min.Y and position.Y <= bounds.max.Y and
+           position.Z >= bounds.min.Z and position.Z <= bounds.max.Z
+end
+
+-- Optimized: Check if an ore should be ignored (much faster)
+local function shouldIgnoreOre(oreModel)
+    if not oreModel or not oreModel:IsA("Model") then
+        return false
+    end
+    
+    local primaryPart = oreModel.PrimaryPart
+    if primaryPart then
+        if isPositionInPlatform(primaryPart.Position) then
+            return true
+        end
+    else
+        for _, child in ipairs(oreModel:GetChildren()) do
+            if child:IsA("BasePart") then
+                if isPositionInPlatform(child.Position) then
+                    return true
+                end
+                break
+            end
+        end
+    end
+    
+    return false
+end
+
+-- Get cached player position
+local function getCachedPlayerPosition()
+    local now = tick()
+    if now - cache.lastPositionUpdate > 0.2 then
+        if player.Character then
+            local humanoidRootPart = player.Character:FindFirstChild("HumanoidRootPart")
+            if humanoidRootPart then
+                cache.playerPosition = humanoidRootPart.Position
+            else
+                cache.playerPosition = nil
+            end
+        else
+            cache.playerPosition = nil
+        end
+        cache.lastPositionUpdate = now
+    end
+    return cache.playerPosition
+end
+
+-- Optimized: Find ores with better caching
+local lastScanTime = 0
+local function findOres()
+    local now = tick()
+    
+    if now - cache.lastOreUpdate < CONFIG.CacheLifetime then
+        return cache.oresCache
+    end
+    
+    if now - lastScanTime < 0.1 then
+        return cache.oresCache
+    end
+    lastScanTime = now
+    
+    local ores = {}
+    
+    local mapFolder = workspace:FindFirstChild("Map")
+    if not mapFolder then
+        cache.oresCache = ores
+        cache.lastOreUpdate = now
+        return ores
+    end
+    
+    local oresFolder = mapFolder:FindFirstChild("Ores")
+    if not oresFolder then
+        cache.oresCache = ores
+        cache.lastOreUpdate = now
+        return ores
+    end
+    
+    local children = oresFolder:GetChildren()
+    
+    for i = 1, #children do
+        local child = children[i]
+        if child:IsA("Model") then
+            if not shouldIgnoreOre(child) then
+                local oreName = child.Name
+                
+                if not SETTINGS.OreWhitelist[oreName] then
+                    SETTINGS.OreWhitelist[oreName] = true
+                    if SETTINGS.VisibleOres[oreName] == nil then
+                        SETTINGS.VisibleOres[oreName] = true
+                    end
+                    saveSettings()
+                end
+                
+                if not ores[oreName] then
+                    ores[oreName] = {
+                        name = oreName,
+                        instances = {},
+                        count = 0
+                    }
+                end
+                table.insert(ores[oreName].instances, child)
+                ores[oreName].count = ores[oreName].count + 1
+            end
+        end
+    end
+    
+    cache.oresCache = ores
+    cache.lastOreUpdate = now
+    
+    return ores
+end
+
+-- Get the latest ore instance for teleportation
+local function getLatestOreInstance(oreName)
+    local latestInstance = nil
+    local latestTime = 0
+    
+    local mapFolder = workspace:FindFirstChild("Map")
+    if not mapFolder then return nil end
+    
+    local oresFolder = mapFolder:FindFirstChild("Ores")
+    if not oresFolder then return nil end
+    
+    local children = oresFolder:GetChildren()
+    for i = 1, #children do
+        local child = children[i]
+        if child:IsA("Model") and child.Name == oreName then
+            if not shouldIgnoreOre(child) then
+                local createTime = tick()
+                if child:GetAttribute("CreationTime") then
+                    createTime = child:GetAttribute("CreationTime")
+                end
+                
+                if createTime > latestTime then
+                    latestTime = createTime
+                    latestInstance = child
+                end
+            end
+        end
+    end
+    
+    return latestInstance
+end
+
+-- Get position of an ore model
+local function getOrePosition(oreModel)
+    if not oreModel or not oreModel:IsA("Model") then
+        return nil
+    end
+    
+    if oreModel.PrimaryPart then
+        return oreModel.PrimaryPart.Position
+    end
+    
+    for _, child in ipairs(oreModel:GetChildren()) do
+        if child:IsA("BasePart") then
+            return child.Position
+        end
+    end
+    
+    return nil
+end
+
+-- Teleport to an ore
+local function teleportToOre(oreName)
+    if not player.Character then return end
+    
+    local humanoidRootPart = player.Character:FindFirstChild("HumanoidRootPart")
+    if not humanoidRootPart then return end
+    
+    local oreInstance = getLatestOreInstance(oreName)
+    if not oreInstance then return end
+    
+    local targetPosition = getOrePosition(oreInstance)
+    if not targetPosition then return end
+    
+    local targetCFrame = CFrame.new(targetPosition + Vector3.new(0, 5, 0))
+    
+    local tweenInfo = TweenInfo.new(
+        0.5,
+        Enum.EasingStyle.Quad,
+        Enum.EasingDirection.Out
+    )
+    
+    TweenService:Create(humanoidRootPart, tweenInfo, {
+        CFrame = targetCFrame
+    }):Play()
+end
+
+-- Optimized Event-based ore tracker
+local OreTracker = {}
+OreTracker.__index = OreTracker
+
+function OreTracker.new()
+    local self = setmetatable({}, OreTracker)
+    self.ores = {}
+    self.eventConnections = {}
+    self.updateCallbacks = {}
+    self.isTracking = false
+    self.lastGUIUpdate = 0
+    self.pendingUpdate = false
+    
+    self.mapFolder = workspace:FindFirstChild("Map")
+    if self.mapFolder then
+        self.oresFolder = self.mapFolder:FindFirstChild("Ores")
+    end
+    
+    return self
+end
+
+function OreTracker:start()
+    if not self.mapFolder or not self.oresFolder then
+        warn("Ore Teleporter: Map or Ores folder not found!")
+        return
+    end
+    
+    self.isTracking = true
+    self:setupEventListeners()
+    self:performScan()
+    
+    task.spawn(function()
+        while self.isTracking do
+            task.wait(CONFIG.AutoUpdateInterval)
+            self:performScan()
+        end
+    end)
+end
+
+function OreTracker:setupEventListeners()
+    if not self.oresFolder then return end
+    
+    local oreAdded = self.oresFolder.ChildAdded:Connect(function(child)
+        task.wait(0.5)
+        if child:IsA("Model") and not shouldIgnoreOre(child) then
+            self:addOre(child)
+        end
+    end)
+    table.insert(self.eventConnections, oreAdded)
+    
+    local oreRemoved = self.oresFolder.ChildRemoved:Connect(function(child)
+        if child:IsA("Model") then
+            self:removeOre(child)
+        end
+    end)
+    table.insert(self.eventConnections, oreRemoved)
+end
+
+function OreTracker:addOre(oreModel)
+    local oreName = oreModel.Name
+    
+    if not self.ores[oreName] then
+        self.ores[oreName] = {
+            name = oreName,
+            instances = {},
+            count = 0
+        }
+    end
+    
+    local exists = false
+    for _, existingOre in ipairs(self.ores[oreName].instances) do
+        if existingOre == oreModel then
+            exists = true
+            break
+        end
+    end
+    
+    if not exists then
+        table.insert(self.ores[oreName].instances, oreModel)
+        self.ores[oreName].count = self.ores[oreName].count + 1
+        
+        if not SETTINGS.OreWhitelist[oreName] then
+            SETTINGS.OreWhitelist[oreName] = true
+            if SETTINGS.VisibleOres[oreName] == nil then
+                SETTINGS.VisibleOres[oreName] = true
+            end
+            saveSettings()
+        end
+        
+        self:scheduleUpdate()
+    end
+end
+
+function OreTracker:removeOre(oreModel)
+    local oreName = oreModel.Name
+    
+    if self.ores[oreName] then
+        for i, existingOre in ipairs(self.ores[oreName].instances) do
+            if existingOre == oreModel then
+                table.remove(self.ores[oreName].instances, i)
+                self.ores[oreName].count = self.ores[oreName].count - 1
+                
+                if self.ores[oreName].count <= 0 then
+                    self.ores[oreName] = nil
+                end
+                
+                self:scheduleUpdate()
+                break
+            end
+        end
+    end
+end
+
+function OreTracker:performScan()
+    if not self.oresFolder then return end
+    
+    local foundOres = {}
+    local children = self.oresFolder:GetChildren()
+    
+    for i = 1, #children do
+        local child = children[i]
+        if child:IsA("Model") and not shouldIgnoreOre(child) then
+            local oreName = child.Name
+            if not foundOres[oreName] then
+                foundOres[oreName] = {
+                    name = oreName,
+                    instances = {},
+                    count = 0
+                }
+            end
+            table.insert(foundOres[oreName].instances, child)
+            foundOres[oreName].count = foundOres[oreName].count + 1
+        end
+    end
+    
+    self.ores = foundOres
+    self:scheduleUpdate()
+end
+
+function OreTracker:scheduleUpdate()
+    if self.pendingUpdate then return end
+    
+    local now = tick()
+    if now - self.lastGUIUpdate >= CONFIG.ThrottleRate then
+        self:notifyUpdate()
+        self.lastGUIUpdate = now
+    else
+        self.pendingUpdate = true
+        task.wait(CONFIG.ThrottleRate)
+        self.pendingUpdate = false
+        self:notifyUpdate()
+        self.lastGUIUpdate = tick()
+    end
+end
+
+function OreTracker:notifyUpdate()
+    for _, callback in ipairs(self.updateCallbacks) do
+        task.spawn(callback, self.ores)
+    end
+end
+
+function OreTracker:onUpdate(callback)
+    table.insert(self.updateCallbacks, callback)
+end
+
+function OreTracker:stop()
+    self.isTracking = false
+    for _, connection in ipairs(self.eventConnections) do
+        connection:Disconnect()
+    end
+    self.eventConnections = {}
+    self.updateCallbacks = {}
+end
+
+-- GUI Creation
+local function createGUI()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "OreTeleporter9000"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    
+    if gethui then
+        gui.Parent = gethui()
+    elseif syn and syn.protect_gui then
+        syn.protect_gui(gui)
+        gui.Parent = game.CoreGui
+    else
+        gui.Parent = game.CoreGui
+    end
+    
+    -- Main Container
+    local mainContainer = Instance.new("Frame")
+    mainContainer.Name = "MainContainer"
+    mainContainer.Size = UDim2.new(0, 350, 0, 400)
+    mainContainer.Position = UDim2.new(0, 20, 0, 200)
+    mainContainer.BackgroundColor3 = COLORS.Background
+    mainContainer.BorderSizePixel = 0
+    mainContainer.Active = true
+    mainContainer.Draggable = true
+    mainContainer.ClipsDescendants = true
+    mainContainer.Parent = gui
+    
+    createRoundedCorners(mainContainer, 8)
+    createStroke(mainContainer, 1, COLORS.Border)
+    
+    -- Title Bar (NOT rounded - will inherit parent's corners)
+    local titleBar = Instance.new("Frame")
+    titleBar.Name = "TitleBar"
+    titleBar.Size = UDim2.new(1, 0, 0, 32)
+    titleBar.BackgroundColor3 = COLORS.Card
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = mainContainer
+    
+    -- DON'T add UICorner to titleBar - let it inherit from mainContainer
+    
+    -- Icon Container
+    local iconContainer = Instance.new("Frame")
+    iconContainer.Name = "IconContainer"
+    iconContainer.Size = UDim2.new(0, 24, 0, 24)
+    iconContainer.Position = UDim2.new(0, 8, 0.5, -12)
+    iconContainer.BackgroundTransparency = 1
+    iconContainer.Parent = titleBar
+    
+    local yinyangIcon = Instance.new("ImageLabel")
+    yinyangIcon.Name = "YinYangIcon"
+    yinyangIcon.Size = UDim2.new(0.7, 0, 0.7, 0)
+    yinyangIcon.Position = UDim2.new(0.15, 0, 0.15, 0)
+    yinyangIcon.AnchorPoint = Vector2.new(0, 0)
+    yinyangIcon.BackgroundTransparency = 1
+    yinyangIcon.Image = "rbxassetid://7019430519"
+    yinyangIcon.ScaleType = Enum.ScaleType.Fit
+    yinyangIcon.Parent = iconContainer
+    
+    -- Rotation animation
+    task.spawn(function()
+        while yinyangIcon and yinyangIcon.Parent do
+            TweenService:Create(yinyangIcon, TweenInfo.new(4, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut), {
+                Rotation = 360
+            }):Play()
+            task.wait(4)
+            yinyangIcon.Rotation = 0
+        end
+    end)
+    
+    -- Title Text
+    local titleText = Instance.new("TextLabel")
+    titleText.Name = "TitleText"
+    titleText.Size = UDim2.new(1, -70, 1, 0)
+    titleText.Position = UDim2.new(0, 38, 0, 0)
+    titleText.BackgroundTransparency = 1
+    titleText.Text = "Ore Teleporter"
+    titleText.TextColor3 = COLORS.Text
+    titleText.Font = Enum.Font.GothamMedium
+    titleText.TextSize = 14
+    titleText.TextXAlignment = Enum.TextXAlignment.Left
+    titleText.Parent = titleBar
+    
+    -- Minimize Button
+    local minimizeButton = Instance.new("TextButton")
+    minimizeButton.Name = "MinimizeButton"
+    minimizeButton.Size = UDim2.new(0, 24, 0, 24)
+    minimizeButton.Position = UDim2.new(1, -28, 0.5, -12)
+    minimizeButton.BackgroundColor3 = COLORS.Card
+    minimizeButton.BorderSizePixel = 0
+    minimizeButton.Text = "─"
+    minimizeButton.TextColor3 = COLORS.TextSecondary
+    minimizeButton.Font = Enum.Font.GothamBold
+    minimizeButton.TextSize = 16
+    minimizeButton.AutoButtonColor = false
+    minimizeButton.Parent = titleBar
+    
+    createRoundedCorners(minimizeButton, 6)
+    createStroke(minimizeButton, 1, COLORS.Border)
+    
+    -- Tab Container
+    local tabContainer = Instance.new("Frame")
+    tabContainer.Name = "TabContainer"
+    tabContainer.Size = UDim2.new(1, -16, 0, 28)
+    tabContainer.Position = UDim2.new(0, 8, 0, 40)
+    tabContainer.BackgroundTransparency = 1
+    tabContainer.Parent = mainContainer
+    
+    -- TP Tab Button
+    local tpTabButton = Instance.new("TextButton")
+    tpTabButton.Name = "TPTabButton"
+    tpTabButton.Size = UDim2.new(0, 80, 1, 0)
+    tpTabButton.Position = UDim2.new(0, 0, 0, 0)
+    tpTabButton.BackgroundColor3 = COLORS.Card
+    tpTabButton.BorderSizePixel = 0
+    tpTabButton.Text = "TELEPORT"
+    tpTabButton.TextColor3 = COLORS.Text
+    tpTabButton.Font = Enum.Font.GothamBold
+    tpTabButton.TextSize = 11
+    tpTabButton.AutoButtonColor = false
+    tpTabButton.Parent = tabContainer
+    
+    createRoundedCorners(tpTabButton, 6)
+    createStroke(tpTabButton, 1, COLORS.Border)
+    
+    -- Settings Tab Button
+    local settingsTabButton = Instance.new("TextButton")
+    settingsTabButton.Name = "SettingsTabButton"
+    settingsTabButton.Size = UDim2.new(0, 90, 1, 0)
+    settingsTabButton.Position = UDim2.new(0, 85, 0, 0)
+    settingsTabButton.BackgroundColor3 = COLORS.Card
+    settingsTabButton.BorderSizePixel = 0
+    settingsTabButton.Text = "SETTINGS"
+    settingsTabButton.TextColor3 = COLORS.TextSecondary
+    settingsTabButton.Font = Enum.Font.GothamBold
+    settingsTabButton.TextSize = 11
+    settingsTabButton.AutoButtonColor = false
+    settingsTabButton.Parent = tabContainer
+    
+    createRoundedCorners(settingsTabButton, 6)
+    createStroke(settingsTabButton, 1, COLORS.Border)
+    
+    -- Content Container
+    local contentContainer = Instance.new("Frame")
+    contentContainer.Name = "ContentContainer"
+    contentContainer.Size = UDim2.new(1, -16, 1, -84)
+    contentContainer.Position = UDim2.new(0, 8, 0, 72)
+    contentContainer.BackgroundTransparency = 1
+    contentContainer.ClipsDescendants = true
+    contentContainer.Parent = mainContainer
+    
+    -- TELEPORT TAB CONTENT
+    local tpContent = Instance.new("Frame")
+    tpContent.Name = "TPContent"
+    tpContent.Size = UDim2.new(1, 0, 1, 0)
+    tpContent.BackgroundTransparency = 1
+    tpContent.Visible = true
+    tpContent.Parent = contentContainer
+    
+    -- Header for TP Tab
+    local headerFrame = Instance.new("Frame")
+    headerFrame.Name = "HeaderFrame"
+    headerFrame.Size = UDim2.new(1, 0, 0, 30)
+    headerFrame.BackgroundColor3 = COLORS.Card
+    headerFrame.BorderSizePixel = 0
+    headerFrame.Parent = tpContent
+    
+    createRoundedCorners(headerFrame, 6)
+    createStroke(headerFrame, 1, COLORS.Border)
+    
+    local oreNameHeader = Instance.new("TextLabel")
+    oreNameHeader.Name = "OreNameHeader"
+    oreNameHeader.Size = UDim2.new(0, 160, 1, 0)
+    oreNameHeader.Position = UDim2.new(0, 10, 0, 0)
+    oreNameHeader.BackgroundTransparency = 1
+    oreNameHeader.Text = "ORE TYPE"
+    oreNameHeader.TextColor3 = COLORS.TextSecondary
+    oreNameHeader.Font = Enum.Font.GothamBold
+    oreNameHeader.TextSize = 11
+    oreNameHeader.TextXAlignment = Enum.TextXAlignment.Left
+    oreNameHeader.Parent = headerFrame
+    
+    local countHeader = Instance.new("TextLabel")
+    countHeader.Name = "CountHeader"
+    countHeader.Size = UDim2.new(0, 70, 1, 0)
+    countHeader.Position = UDim2.new(0, 180, 0, 0)
+    countHeader.BackgroundTransparency = 1
+    countHeader.Text = "COUNT"
+    countHeader.TextColor3 = COLORS.TextSecondary
+    countHeader.Font = Enum.Font.GothamBold
+    countHeader.TextSize = 11
+    countHeader.TextXAlignment = Enum.TextXAlignment.Center
+    countHeader.Parent = headerFrame
+    
+    local actionHeader = Instance.new("TextLabel")
+    actionHeader.Name = "ActionHeader"
+    actionHeader.Size = UDim2.new(0, 80, 1, 0)
+    actionHeader.Position = UDim2.new(1, -90, 0, 0)
+    actionHeader.BackgroundTransparency = 1
+    actionHeader.Text = "TELEPORT"
+    actionHeader.TextColor3 = COLORS.TextSecondary
+    actionHeader.Font = Enum.Font.GothamBold
+    actionHeader.TextSize = 11
+    actionHeader.TextXAlignment = Enum.TextXAlignment.Center
+    actionHeader.Parent = headerFrame
+    
+    -- Scroll Container for TP Tab
+    local tpScrollContainer = Instance.new("Frame")
+    tpScrollContainer.Name = "TPScrollContainer"
+    tpScrollContainer.Size = UDim2.new(1, 0, 1, -36)
+    tpScrollContainer.Position = UDim2.new(0, 0, 0, 36)
+    tpScrollContainer.BackgroundTransparency = 1
+    tpScrollContainer.ClipsDescendants = true
+    tpScrollContainer.Parent = tpContent
+    
+    -- Scrolling Frame for TP Tab
+    local tpScrollingFrame = Instance.new("ScrollingFrame")
+    tpScrollingFrame.Name = "OreList"
+    tpScrollingFrame.Size = UDim2.new(1, 0, 1, 0)
+    tpScrollingFrame.Position = UDim2.new(0, 0, 0, 0)
+    tpScrollingFrame.BackgroundTransparency = 1
+    tpScrollingFrame.BorderSizePixel = 0
+    tpScrollingFrame.ScrollBarThickness = 4
+    tpScrollingFrame.ScrollBarImageColor3 = COLORS.Border
+    tpScrollingFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    tpScrollingFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    tpScrollingFrame.Parent = tpScrollContainer
+    
+    -- UIListLayout for TP Tab
+    local tpListLayout = Instance.new("UIListLayout")
+    tpListLayout.Name = "ListLayout"
+    tpListLayout.Padding = UDim.new(0, 4)
+    tpListLayout.SortOrder = Enum.SortOrder.Name
+    tpListLayout.Parent = tpScrollingFrame
+    
+    -- No Ores Text for TP Tab
+    local noOresText = Instance.new("TextLabel")
+    noOresText.Name = "NoOresText"
+    noOresText.Size = UDim2.new(1, 0, 0, 100)
+    noOresText.Position = UDim2.new(0, 0, 0.5, -50)
+    noOresText.BackgroundTransparency = 1
+    noOresText.Text = "No ores found"
+    noOresText.TextColor3 = COLORS.TextSecondary
+    noOresText.Font = Enum.Font.Gotham
+    noOresText.TextSize = 13
+    noOresText.TextWrapped = true
+    noOresText.Visible = false
+    noOresText.Parent = tpScrollContainer
+    
+    -- SETTINGS TAB CONTENT
+    local settingsContent = Instance.new("Frame")
+    settingsContent.Name = "SettingsContent"
+    settingsContent.Size = UDim2.new(1, 0, 1, 0)
+    settingsContent.BackgroundTransparency = 1
+    settingsContent.Visible = false
+    settingsContent.Parent = contentContainer
+    
+    -- Settings Title
+    local settingsTitle = Instance.new("TextLabel")
+    settingsTitle.Name = "SettingsTitle"
+    settingsTitle.Size = UDim2.new(1, 0, 0, 30)
+    settingsTitle.Position = UDim2.new(0, 0, 0, 0)
+    settingsTitle.BackgroundTransparency = 1
+    settingsTitle.Text = "VISIBLE ORES"
+    settingsTitle.TextColor3 = COLORS.TextSecondary
+    settingsTitle.Font = Enum.Font.GothamBold
+    settingsTitle.TextSize = 12
+    settingsTitle.TextXAlignment = Enum.TextXAlignment.Center
+    settingsTitle.Parent = settingsContent
+    
+    -- Settings Description
+    local settingsDesc = Instance.new("TextLabel")
+    settingsDesc.Name = "SettingsDesc"
+    settingsDesc.Size = UDim2.new(1, -20, 0, 40)
+    settingsDesc.Position = UDim2.new(0, 10, 0, 30)
+    settingsDesc.BackgroundTransparency = 1
+    settingsDesc.Text = "Toggle which ores are shown in the Teleport tab."
+    settingsDesc.TextColor3 = COLORS.TextSecondary
+    settingsDesc.Font = Enum.Font.Gotham
+    settingsDesc.TextSize = 10
+    settingsDesc.TextWrapped = true
+    settingsDesc.TextXAlignment = Enum.TextXAlignment.Left
+    settingsDesc.Parent = settingsContent
+    
+    -- Scroll Container for Settings Tab
+    local settingsScrollContainer = Instance.new("Frame")
+    settingsScrollContainer.Name = "SettingsScrollContainer"
+    settingsScrollContainer.Size = UDim2.new(1, 0, 1, -80)
+    settingsScrollContainer.Position = UDim2.new(0, 0, 0, 80)
+    settingsScrollContainer.BackgroundTransparency = 1
+    settingsScrollContainer.ClipsDescendants = true
+    settingsScrollContainer.Parent = settingsContent
+    
+    -- Scrolling Frame for Settings Tab
+    local settingsScrollingFrame = Instance.new("ScrollingFrame")
+    settingsScrollingFrame.Name = "SettingsList"
+    settingsScrollingFrame.Size = UDim2.new(1, 0, 1, 0)
+    settingsScrollingFrame.Position = UDim2.new(0, 0, 0, 0)
+    settingsScrollingFrame.BackgroundTransparency = 1
+    settingsScrollingFrame.BorderSizePixel = 0
+    settingsScrollingFrame.ScrollBarThickness = 4
+    settingsScrollingFrame.ScrollBarImageColor3 = COLORS.Border
+    settingsScrollingFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    settingsScrollingFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    settingsScrollingFrame.Parent = settingsScrollContainer
+    
+    -- UIListLayout for Settings Tab
+    local settingsListLayout = Instance.new("UIListLayout")
+    settingsListLayout.Name = "SettingsListLayout"
+    settingsListLayout.Padding = UDim.new(0, 4)
+    settingsListLayout.SortOrder = Enum.SortOrder.Name
+    settingsListLayout.Parent = settingsScrollingFrame
+    
+    -- No Settings Text
+    local noSettingsText = Instance.new("TextLabel")
+    noSettingsText.Name = "NoSettingsText"
+    noSettingsText.Size = UDim2.new(1, 0, 0, 100)
+    noSettingsText.Position = UDim2.new(0, 0, 0.5, -50)
+    noSettingsText.BackgroundTransparency = 1
+    noSettingsText.Text = "No ores in settings yet"
+    noSettingsText.TextColor3 = COLORS.TextSecondary
+    noSettingsText.Font = Enum.Font.Gotham
+    noSettingsText.TextSize = 13
+    noSettingsText.TextWrapped = true
+    noSettingsText.Visible = false
+    noSettingsText.Parent = settingsScrollContainer
+    
+    -- MINIMIZED BAR (Fixed - now has icon and title)
+    local minimizedBar = Instance.new("Frame")
+    minimizedBar.Name = "MinimizedBar"
+    minimizedBar.Size = UDim2.new(0, 350, 0, 32)
+    minimizedBar.Position = UDim2.new(0, 20, 0, 200)
+    minimizedBar.BackgroundColor3 = COLORS.Card
+    minimizedBar.BorderSizePixel = 0
+    minimizedBar.Active = true
+    minimizedBar.Draggable = true
+    minimizedBar.Visible = false
+    minimizedBar.Parent = gui
+    
+    createRoundedCorners(minimizedBar, 8)
+    createStroke(minimizedBar, 1, COLORS.Border)
+    
+    -- Icon Container for Minimized Bar
+    local minimizedIconContainer = Instance.new("Frame")
+    minimizedIconContainer.Name = "IconContainer"
+    minimizedIconContainer.Size = UDim2.new(0, 24, 0, 24)
+    minimizedIconContainer.Position = UDim2.new(0, 8, 0.5, -12)
+    minimizedIconContainer.BackgroundTransparency = 1
+    minimizedIconContainer.Parent = minimizedBar
+    
+    local minimizedYinyangIcon = Instance.new("ImageLabel")
+    minimizedYinyangIcon.Name = "YinYangIcon"
+    minimizedYinyangIcon.Size = UDim2.new(0.7, 0, 0.7, 0)
+    minimizedYinyangIcon.Position = UDim2.new(0.15, 0, 0.15, 0)
+    minimizedYinyangIcon.AnchorPoint = Vector2.new(0, 0)
+    minimizedYinyangIcon.BackgroundTransparency = 1
+    minimizedYinyangIcon.Image = "rbxassetid://7019430519"
+    minimizedYinyangIcon.ScaleType = Enum.ScaleType.Fit
+    minimizedYinyangIcon.Parent = minimizedIconContainer
+    
+    -- Rotation animation for minimized icon
+    task.spawn(function()
+        while minimizedYinyangIcon and minimizedYinyangIcon.Parent do
+            TweenService:Create(minimizedYinyangIcon, TweenInfo.new(4, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut), {
+                Rotation = 360
+            }):Play()
+            task.wait(4)
+            minimizedYinyangIcon.Rotation = 0
+        end
+    end)
+    
+    -- Title Text for Minimized Bar
+    local minimizedTitleText = Instance.new("TextLabel")
+    minimizedTitleText.Name = "TitleText"
+    minimizedTitleText.Size = UDim2.new(1, -70, 1, 0)
+    minimizedTitleText.Position = UDim2.new(0, 38, 0, 0)
+    minimizedTitleText.BackgroundTransparency = 1
+    minimizedTitleText.Text = "Ore Teleporter"
+    minimizedTitleText.TextColor3 = COLORS.Text
+    minimizedTitleText.Font = Enum.Font.GothamMedium
+    minimizedTitleText.TextSize = 14
+    minimizedTitleText.TextXAlignment = Enum.TextXAlignment.Left
+    minimizedTitleText.Parent = minimizedBar
+    
+    -- Restore Button for Minimized Bar
+    local restoreButton = Instance.new("TextButton")
+    restoreButton.Name = "RestoreButton"
+    restoreButton.Size = UDim2.new(0, 24, 0, 24)
+    restoreButton.Position = UDim2.new(1, -28, 0.5, -12)
+    restoreButton.BackgroundColor3 = COLORS.Card
+    restoreButton.BorderSizePixel = 0
+    restoreButton.Text = "＋"
+    restoreButton.TextColor3 = COLORS.TextSecondary
+    restoreButton.Font = Enum.Font.GothamBold
+    restoreButton.TextSize = 16
+    restoreButton.AutoButtonColor = false
+    restoreButton.Parent = minimizedBar
+    
+    createRoundedCorners(restoreButton, 6)
+    createStroke(restoreButton, 1, COLORS.Border)
+    
+    -- Create Ore Tracker
+    local oreTracker = OreTracker.new()
+    
+    -- Store ore list items
+    local oreListItems = {}
+    local settingsListItems = {}
+    
+    -- Function to create ore list item for TP tab
+    local function createOreListItem(oreName, count)
+        local listItem = Instance.new("Frame")
+        listItem.Name = oreName
+        listItem.Size = UDim2.new(1, 0, 0, 40)
+        listItem.BackgroundColor3 = COLORS.Card
+        listItem.BorderSizePixel = 0
+        
+        createRoundedCorners(listItem, 6)
+        createStroke(listItem, 1, COLORS.Border)
+        
+        -- Ore Name
+        local nameLabel = Instance.new("TextLabel")
+        nameLabel.Name = "NameLabel"
+        nameLabel.Size = UDim2.new(0, 160, 1, 0)
+        nameLabel.Position = UDim2.new(0, 10, 0, 0)
+        nameLabel.BackgroundTransparency = 1
+        nameLabel.Text = oreName
+        nameLabel.TextColor3 = COLORS.Text
+        nameLabel.Font = Enum.Font.GothamMedium
+        nameLabel.TextSize = 12
+        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+        nameLabel.Parent = listItem
+        
+        -- Ore Count
+        local countLabel = Instance.new("TextLabel")
+        countLabel.Name = "CountLabel"
+        countLabel.Size = UDim2.new(0, 70, 1, 0)
+        countLabel.Position = UDim2.new(0, 180, 0, 0)
+        countLabel.BackgroundTransparency = 1
+        countLabel.Text = tostring(count)
+        countLabel.TextColor3 = COLORS.Text
+        countLabel.Font = Enum.Font.GothamMedium
+        countLabel.TextSize = 12
+        countLabel.TextXAlignment = Enum.TextXAlignment.Center
+        countLabel.Parent = listItem
+        
+        -- Teleport Button
+        local teleportButton = Instance.new("TextButton")
+        teleportButton.Name = "TeleportButton"
+        teleportButton.Size = UDim2.new(0, 70, 0, 26)
+        teleportButton.Position = UDim2.new(1, -80, 0.5, -13)
+        teleportButton.BackgroundColor3 = COLORS.White
+        teleportButton.BorderSizePixel = 0
+        teleportButton.Text = "GO"
+        teleportButton.TextColor3 = COLORS.Black
+        teleportButton.Font = Enum.Font.GothamBold
+        teleportButton.TextSize = 11
+        teleportButton.AutoButtonColor = false
+        teleportButton.Parent = listItem
+        
+        createRoundedCorners(teleportButton, 4)
+        createStroke(teleportButton, 2, COLORS.Black)
+        
+        -- Button hover effects
+        teleportButton.MouseEnter:Connect(function()
+            TweenService:Create(teleportButton, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                BackgroundColor3 = Color3.fromRGB(230, 230, 230)
+            }):Play()
+        end)
+        
+        teleportButton.MouseLeave:Connect(function()
+            TweenService:Create(teleportButton, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                BackgroundColor3 = COLORS.White
+            }):Play()
+        end)
+        
+        -- Teleport function
+        teleportButton.MouseButton1Click:Connect(function()
+            teleportToOre(oreName)
+            
+            TweenService:Create(teleportButton, TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                Size = UDim2.new(0, 66, 0, 24)
+            }):Play()
+            task.wait(0.1)
+            TweenService:Create(teleportButton, TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                Size = UDim2.new(0, 70, 0, 26)
+            }):Play()
+        end)
+        
+        return listItem
+    end
+    
+    -- Function to create settings list item
+    local function createSettingsListItem(oreName, isVisible)
+        local listItem = Instance.new("Frame")
+        listItem.Name = oreName
+        listItem.Size = UDim2.new(1, 0, 0, 36)
+        listItem.BackgroundColor3 = COLORS.Card
+        listItem.BorderSizePixel = 0
+        
+        createRoundedCorners(listItem, 6)
+        createStroke(listItem, 1, COLORS.Border)
+        
+        -- Ore Name
+        local nameLabel = Instance.new("TextLabel")
+        nameLabel.Name = "NameLabel"
+        nameLabel.Size = UDim2.new(0, 200, 1, 0)
+        nameLabel.Position = UDim2.new(0, 10, 0, 0)
+        nameLabel.BackgroundTransparency = 1
+        nameLabel.Text = oreName
+        nameLabel.TextColor3 = COLORS.Text
+        nameLabel.Font = Enum.Font.GothamMedium
+        nameLabel.TextSize = 12
+        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+        nameLabel.Parent = listItem
+        
+        -- Toggle Button
+        local toggleButton = Instance.new("TextButton")
+        toggleButton.Name = "ToggleButton"
+        toggleButton.Size = UDim2.new(0, 80, 0, 26)
+        toggleButton.Position = UDim2.new(1, -90, 0.5, -13)
+        toggleButton.BackgroundColor3 = isVisible and COLORS.White or Color3.fromRGB(80, 80, 80)
+        toggleButton.BorderSizePixel = 0
+        toggleButton.Text = isVisible and "SHOWN" or "HIDDEN"
+        toggleButton.TextColor3 = isVisible and COLORS.Black or COLORS.TextSecondary
+        toggleButton.Font = Enum.Font.GothamBold
+        toggleButton.TextSize = 11
+        toggleButton.AutoButtonColor = false
+        toggleButton.Parent = listItem
+        
+        createRoundedCorners(toggleButton, 4)
+        createStroke(toggleButton, 2, COLORS.Black)
+        
+        -- Toggle function
+        toggleButton.MouseButton1Click:Connect(function()
+            local newState = not SETTINGS.VisibleOres[oreName]
+            SETTINGS.VisibleOres[oreName] = newState
+            saveSettings()
+            
+            toggleButton.BackgroundColor3 = newState and COLORS.White or Color3.fromRGB(80, 80, 80)
+            toggleButton.Text = newState and "SHOWN" or "HIDDEN"
+            toggleButton.TextColor3 = newState and COLORS.Black or COLORS.TextSecondary
+            
+            if tpContent.Visible then
+                updateOreList(oreTracker.ores)
+            end
+        end)
+        
+        return listItem
+    end
+    
+    -- Update TP ore list (throttled)
+    local lastTPUpdate = 0
+    local function updateOreList(ores)
+        local now = tick()
+        if now - lastTPUpdate < 0.5 then
+            return
+        end
+        lastTPUpdate = now
+        
+        for _, item in pairs(oreListItems) do
+            item:Destroy()
+        end
+        oreListItems = {}
+        
+        local visibleOreNames = {}
+        for oreName, isVisible in pairs(SETTINGS.VisibleOres) do
+            if isVisible and ores[oreName] and ores[oreName].count > 0 then
+                table.insert(visibleOreNames, oreName)
+            end
+        end
+        
+        table.sort(visibleOreNames)
+        
+        for _, oreName in ipairs(visibleOreNames) do
+            local oreData = ores[oreName]
+            if oreData and oreData.count > 0 then
+                local listItem = createOreListItem(oreName, oreData.count)
+                listItem.Parent = tpScrollingFrame
+                oreListItems[oreName] = listItem
+            end
+        end
+        
+        noOresText.Visible = #visibleOreNames == 0
+    end
+    
+    -- Update settings list (only once when settings tab is opened)
+    local settingsUpdated = false
+    local function updateSettingsList()
+        if settingsUpdated and not settingsContent.Visible then
+            return
+        end
+        
+        for _, item in pairs(settingsListItems) do
+            item:Destroy()
+        end
+        settingsListItems = {}
+        
+        local oreNames = {}
+        for oreName, _ in pairs(SETTINGS.OreWhitelist) do
+            table.insert(oreNames, oreName)
+        end
+        
+        table.sort(oreNames)
+        
+        for _, oreName in ipairs(oreNames) do
+            local isVisible = SETTINGS.VisibleOres[oreName] or false
+            local listItem = createSettingsListItem(oreName, isVisible)
+            listItem.Parent = settingsScrollingFrame
+            settingsListItems[oreName] = listItem
+        end
+        
+        noSettingsText.Visible = #oreNames == 0
+        
+        settingsUpdated = true
+    end
+    
+    -- Connect ore tracker updates
+    oreTracker:onUpdate(function(ores)
+        updateOreList(ores)
+    end)
+    
+    -- Start ore tracker
+    task.spawn(function()
+        task.wait(2)
+        oreTracker:start()
+    end)
+    
+    -- Tab switching
+    local function switchToTab(tabName)
+        if tabName == "tp" then
+            tpContent.Visible = true
+            settingsContent.Visible = false
+            tpTabButton.TextColor3 = COLORS.Text
+            settingsTabButton.TextColor3 = COLORS.TextSecondary
+            
+            tpTabButton.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+            settingsTabButton.BackgroundColor3 = COLORS.Card
+            
+            updateOreList(oreTracker.ores)
+        else
+            tpContent.Visible = false
+            settingsContent.Visible = true
+            tpTabButton.TextColor3 = COLORS.TextSecondary
+            settingsTabButton.TextColor3 = COLORS.Text
+            
+            tpTabButton.BackgroundColor3 = COLORS.Card
+            settingsTabButton.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+            
+            updateSettingsList()
+        end
+    end
+    
+    -- Tab button click events
+    tpTabButton.MouseButton1Click:Connect(function()
+        switchToTab("tp")
+    end)
+    
+    settingsTabButton.MouseButton1Click:Connect(function()
+        switchToTab("settings")
+    end)
+    
+    -- Button hover effects
+    local function setupButtonHover(button, defaultColor, hoverColor)
+        button.MouseEnter:Connect(function()
+            TweenService:Create(button, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                BackgroundColor3 = hoverColor
+            }):Play()
+            TweenService:Create(button, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                TextColor3 = COLORS.White
+            }):Play()
+        end)
+        
+        button.MouseLeave:Connect(function()
+            TweenService:Create(button, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                BackgroundColor3 = defaultColor
+            }):Play()
+            local textColor = button == tpTabButton and tpContent.Visible and COLORS.Text or 
+                            button == settingsTabButton and settingsContent.Visible and COLORS.Text or 
+                            COLORS.TextSecondary
+            TweenService:Create(button, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                TextColor3 = textColor
+            }):Play()
+        end)
+    end
+    
+    -- Setup hover effects
+    setupButtonHover(minimizeButton, COLORS.Card, Color3.fromRGB(50, 50, 50))
+    setupButtonHover(restoreButton, COLORS.Card, Color3.fromRGB(50, 50, 50))
+    setupButtonHover(tpTabButton, tpContent.Visible and Color3.fromRGB(50, 50, 50) or COLORS.Card, Color3.fromRGB(60, 60, 60))
+    setupButtonHover(settingsTabButton, settingsContent.Visible and Color3.fromRGB(50, 50, 50) or COLORS.Card, Color3.fromRGB(60, 60, 60))
+    
+    -- Minimize/Restore functionality
+    local isMinimizing = false
+    
+    minimizeButton.MouseButton1Click:Connect(function()
+        if isMinimizing then return end
+        isMinimizing = true
+        
+        local startPos = mainContainer.Position
+        
+        TweenService:Create(mainContainer, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, 350, 0, 32)
+        }):Play()
+        
+        task.wait(0.25)
+        
+        mainContainer.Visible = false
+        minimizedBar.Position = startPos
+        minimizedBar.Visible = true
+        
+        isMinimizing = false
+    end)
+    
+    restoreButton.MouseButton1Click:Connect(function()
+        if isMinimizing then return end
+        isMinimizing = true
+        
+        local minimizedPos = minimizedBar.Position
+        
+        minimizedBar.Visible = false
+        mainContainer.Position = minimizedPos
+        mainContainer.Size = UDim2.new(0, 350, 0, 32)
+        mainContainer.Visible = true
+        
+        TweenService:Create(mainContainer, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, 350, 0, 400)
+        }):Play()
+        
+        task.wait(0.25)
+        isMinimizing = false
+    end)
+    
+    -- Cleanup function
+    local function cleanup()
+        oreTracker:stop()
+    end
+    
+    return {
+        GUI = gui,
+        cleanup = cleanup,
+        updateOreList = updateOreList,
+        teleportToOre = teleportToOre,
+        findOres = findOres,
+        updateSettingsList = updateSettingsList
+    }
+end
+
+-- Load settings first
+loadSettings()
+
+-- Pre-calculate platform bounds
+calculatePlatformBounds()
+
+-- Create the GUI
+local oreGUI = createGUI()
+
+return oreGUI
